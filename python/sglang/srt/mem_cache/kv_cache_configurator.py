@@ -63,6 +63,8 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    configured_dcp_size,
+    configured_pp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -70,6 +72,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -276,7 +281,7 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = self.server_args.dcp_size
+        dcp_size = configured_dcp_size()
         return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
 
     @property
@@ -403,7 +408,7 @@ class KVCacheConfigurator:
                     mamba_spec_state_size=sizes.max_running_requests,
                     cache_params=self.mambaish_config.mamba2_cache_params,
                     device=self.device,
-                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
                     draft_model_idx=self.draft_model_idx,
                     speculative_eagle_topk=get_spec().speculative_eagle_topk,
                 )
@@ -509,7 +514,7 @@ class KVCacheConfigurator:
             max_mamba_cache_size=get_schedule().max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
@@ -632,7 +637,7 @@ class KVCacheConfigurator:
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -709,9 +714,9 @@ class KVCacheConfigurator:
                     if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             pre_alloc_size=pre_alloc_size,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -763,7 +768,7 @@ class KVCacheConfigurator:
     ) -> ReqToTokenPool:
         # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
         # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (self.server_args.speculative_algorithm or "").upper()
+        _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
@@ -788,9 +793,9 @@ class KVCacheConfigurator:
                     if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
-            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
+            enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
+            speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -879,7 +884,7 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
@@ -1028,9 +1033,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
-            online_mtp_max_draft_tokens=(
-                self.server_args.max_speculative_num_draft_tokens or 0
-            ),
+            online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
         return token_to_kv_pool
 
@@ -1475,7 +1478,7 @@ class KVCacheConfigurator:
                     need_sort=need_sort,
                 )
             elif _is_npu and (
-                self.server_args.attention_backend == "ascend"
+                get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
@@ -1548,9 +1551,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
-                    elif (
-                        get_schedule().page_size == 1 and self.server_args.dcp_size == 1
-                    ):
+                    elif get_schedule().page_size == 1 and configured_dcp_size() == 1:
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -1560,9 +1561,8 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * self.server_args.dcp_size,
-                            page_size=get_schedule().page_size
-                            * self.server_args.dcp_size,
+                            sizes.max_total_num_tokens * configured_dcp_size(),
+                            page_size=get_schedule().page_size * configured_dcp_size(),
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
@@ -1665,17 +1665,17 @@ class KVCacheConfigurator:
         )
 
         additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
+        if mamba_extra_buffer_enabled():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
             # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
             if not get_schedule().disable_overlap_schedule:
-                if self.server_args.enable_mamba_extra_buffer_lazy():
+                if mamba_extra_buffer_lazy_enabled():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
                 assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                    not mamba_extra_buffer_lazy_enabled()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
@@ -1704,7 +1704,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if self.server_args.pp_size > 1:
+        if configured_pp_size() > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

@@ -137,25 +137,19 @@ class TestGetDcpLens(CustomTestCase):
         )
         allocators = {}
 
-        # The configurator's bag reads (disaggregation_mode / page_size /
-        # enable_hisparse) come from the published context; the per-iteration
-        # dcp_size stays on the injected instance stand-in.
-        self._sa_override = rc.get_context().override_server_args(
-            disaggregation_mode="null",
-            page_size=physical_page_size,
-            enable_hisparse=False,
-        )
-        self._sa_override.install()
-        self.addCleanup(self._sa_override.restore)
-
+        # Every input the configurator consults is a published leaf now,
+        # dcp_size included, so each iteration publishes its own config.
         for dcp_size in (1, 4):
+            override = rc.get_context().override_server_args(
+                disaggregation_mode="null",
+                page_size=physical_page_size,
+                enable_hisparse=False,
+                dcp_size=dcp_size,
+            )
+            override.install()
+            self.addCleanup(override.restore)
             configurator = SimpleNamespace(
-                server_args=SimpleNamespace(
-                    disaggregation_mode="null",
-                    enable_hisparse=False,
-                    page_size=physical_page_size,
-                    dcp_size=dcp_size,
-                ),
+                server_args=SimpleNamespace(),
                 hybrid_gdn_config=None,
                 is_hybrid_swa=False,
                 kv_cache_dtype=torch.bfloat16,
