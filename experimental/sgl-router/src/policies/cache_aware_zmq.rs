@@ -959,6 +959,7 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 max_output_tokens: None,
+                forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -1661,6 +1662,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -1724,6 +1726,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
@@ -1754,6 +1757,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -2781,6 +2785,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
 
@@ -2840,6 +2845,7 @@ mod tests {
                     thinking: true,
                     reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::None,
                 },
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         assert_eq!(thinking_ids, expected_thinking);

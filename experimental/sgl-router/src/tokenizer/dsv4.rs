@@ -29,8 +29,18 @@
 //! call (see [`sort_tool_results_by_call_order`]). Byte-exactness here is what
 //! lets a tool-carrying request's block hashes match the engine's cached blocks
 //! instead of diverging from the first block (tools) or the first assistant turn
-//! (thinking) and routing by min-load. `tasks` stay out of scope — they drive
-//! internal task-classification rendering and never appear on router traffic.
+//! (thinking) and routing by min-load. Two more engine behaviors are mirrored
+//! so the ids are engine-equivalent on nearly all dsv4 chat traffic and can be
+//! forwarded as `input_ids`: the `task` quick instructions
+//! ([`attach_task`], task special tokens in [`render_one`]) and the
+//! trailing-assistant surgery behind `continue_final_message`
+//! ([`handle_trailing_assistant`], prefix re-appended by the encoder caller,
+//! mirroring `_append_assistant_prefix_to_prompt_ids`). What is NOT mirrored —
+//! non-text content parts, message-level `wo_eos` / `mask` / client-sent
+//! `content_blocks`, and the top-level `reasoning` object — stays withheld
+//! from forwarding by `input_ids_safe_to_forward_dsv4`; the render here
+//! ignores those keys, so such traffic only degrades routing, never
+//! correctness.
 //!
 //! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
 //! HF wrapper hardcodes `add_special_tokens = false`;
@@ -56,6 +66,187 @@ const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
 /// DSML block token wrapping tool-call / tools markup (`encoding_dsv4.dsml_token`).
 const DSML: &str = "｜DSML｜";
+
+/// The `encoding_dsv4.DS_TASK_SP_TOKENS` map — special tokens appended after
+/// a task-carrying message. Valid task names are exactly these keys; anything
+/// else is an engine-side assertion failure (`VALID_TASKS`).
+fn task_sp_token(task: &str) -> Option<&'static str> {
+    match task {
+        "action" => Some("<｜action｜>"),
+        "query" => Some("<｜query｜>"),
+        "authority" => Some("<｜authority｜>"),
+        "domain" => Some("<｜domain｜>"),
+        "title" => Some("<｜title｜>"),
+        "read_url" => Some("<｜read_url｜>"),
+        _ => None,
+    }
+}
+
+/// Request-level fields beyond `messages`/`tools` that steer the engine's
+/// dsv4 encoding (`serving_chat` dsv4 branch) and which the router must
+/// mirror to remain engine-equivalent. Ignored by the Jinja chat encoder.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestParts<'a> {
+    /// The request-level `task` (encoding_dsv4's quick-instruction tasks):
+    /// attached to the last user/developer message and rendered as a task
+    /// special token. `None` for ordinary traffic. (A non-string `task`
+    /// fails engine-side pydantic validation, so the wiring treats it as
+    /// absent — the engine rejects that request visibly either way.)
+    pub task: Option<&'a str>,
+    /// OpenAI `continue_final_message` (default false). With a trailing
+    /// assistant message the engine extracts it and appends its text AFTER
+    /// the generation prompt, so generation continues the client's sentence.
+    /// Coerce request values with [`openai_bool`], not a bare `as_bool`.
+    pub continue_final_message: bool,
+}
+
+/// Parse a JSON value as a coerced OpenAI boolean. Lives in
+/// [`crate::tokenizer::openai_bool`]; re-exported here so existing dsv4
+/// encoder call sites keep reading naturally.
+pub use crate::tokenizer::openai_bool;
+
+/// Errors from engine-mirroring pre-processing. Each corresponds to a case
+/// the ENGINE errors on too (a `ValueError`/`AssertionError` in
+/// `serving_chat`/`encoding_dsv4`), so the caller treating it as "not
+/// engine-equivalent" reproduces the engine's own outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderErr {
+    /// `task` present but no user/developer message —
+    /// `attach_task_to_last_user_message`'s `ValueError`.
+    TaskWithoutUser,
+    /// A task name outside `encoding_dsv4.VALID_TASKS` (on the request field
+    /// or any message) — the render-time `assert`.
+    InvalidTask,
+}
+
+impl std::fmt::Display for RenderErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderErr::TaskWithoutUser => write!(f, "`task` requires a user/developer message"),
+            RenderErr::InvalidTask => write!(f, "task outside encoding_dsv4.VALID_TASKS"),
+        }
+    }
+}
+
+impl std::error::Error for RenderErr {}
+
+/// Mirror `serving_chat._handle_last_assistant_message` as the engine's dsv4
+/// branch applies it. The engine flattens content BEFORE the surgery (string
+/// as-is, `null`/absent → `""`, text-parts arrays → their text join — see
+/// [`content_to_string`]), so when the trailing message is an assistant turn
+/// the surgery sees a string in every one of those shapes:
+///   * `continue_final_message = true`: the message is REMOVED and its
+///     flattened content handed back as the prefix (the caller encodes it and
+///     appends after the generation prompt);
+///   * `continue_final_message = false`: the message is REPLACED wholesale
+///     with `{"role": "user", "content": flattened}` — dropping every other
+///     key (`task`, `tool_calls`, …), not just flipping `role`.
+///
+/// Content that cannot be flattened (nothing else the caller routes here) is
+/// left untouched in both modes, as is any other trailing role.
+///
+/// Returns the extracted prefix (possibly empty — the engine treats `""` as
+/// no prefix via its `if assistant_prefix` check).
+fn handle_trailing_assistant(
+    messages: &mut Vec<serde_json::Value>,
+    continue_final_message: bool,
+) -> Option<String> {
+    let trailing_role = messages
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str());
+    if trailing_role != Some("assistant") {
+        return None;
+    }
+    let flattened = match messages.last().and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        // Flattened to "" by the engine before the surgery.
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(serde_json::Value::Array(_)) => {
+            content_to_string(messages.last().and_then(|m| m.get("content")))
+        }
+        // Unflattenable content (non-string scalar) — left untouched.
+        Some(_) => return None,
+    };
+    if continue_final_message {
+        messages.pop();
+        Some(flattened)
+    } else {
+        *messages.last_mut().unwrap() = serde_json::json!({"role": "user", "content": flattened});
+        None
+    }
+}
+
+/// Mirror `encoding_dsv4.find_last_user_index` + `attach_task_to_last_user_message`:
+/// set `task` on the most recent user/developer message. Errs when none
+/// exists (the engine's `ValueError`) and when the task name is invalid (the
+/// render-time `VALID_TASKS` assert — surfaced here so failure modes are
+/// uniform).
+fn attach_task(messages: &mut Vec<serde_json::Value>, task: &str) -> Result<(), RenderErr> {
+    if task_sp_token(task).is_none() {
+        return Err(RenderErr::InvalidTask);
+    }
+    let idx = messages
+        .iter()
+        .rposition(|m| {
+            matches!(
+                m.get("role").and_then(|r| r.as_str()),
+                Some("user") | Some("developer")
+            )
+        })
+        .ok_or(RenderErr::TaskWithoutUser)?;
+    messages[idx]["task"] = serde_json::json!(task);
+    Ok(())
+}
+
+/// Render a whole request the way the engine's dsv4 branch does
+/// (`serving_chat`): trailing-assistant surgery, then `task` attachment,
+/// then [`render_messages`]. Returns the rendered prompt and, when
+/// `continue_final_message` extracted a trailing assistant turn, its content
+/// — the caller encodes that text and appends the ids after the prompt ids
+/// (`_append_assistant_prefix_to_prompt_ids`).
+pub fn render_request(
+    messages: &serde_json::Value,
+    tools: Option<&serde_json::Value>,
+    opts: RenderOpts,
+    parts: RequestParts<'_>,
+) -> Result<(String, Option<String>), RenderErr> {
+    let mut raw = messages
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .to_vec();
+    for m in &mut raw {
+        // Protocol message validation normalizes roles to lowercase.
+        if let Some(role) = m.get("role").and_then(|r| r.as_str()).map(str::to_owned) {
+            m["role"] = serde_json::json!(role.to_ascii_lowercase());
+        }
+        // Client-sent message-level `task` never reaches encoding_dsv4 (the
+        // message model has no such declared field), so it is stripped exactly
+        // where the engine strips it — the only task that renders is the
+        // request-level one attached below.
+        if let serde_json::Value::Object(o) = m {
+            o.remove("task");
+        }
+    }
+    let prefix = handle_trailing_assistant(&mut raw, parts.continue_final_message);
+    if let Some(task) = parts.task {
+        attach_task(&mut raw, task)?;
+    }
+    // Validate the remaining (attach-set) task keys — the engine's
+    // render-time `VALID_TASKS` assert.
+    for m in &raw {
+        if let Some(t) = m.get("task").and_then(|t| t.as_str()) {
+            if task_sp_token(t).is_none() {
+                return Err(RenderErr::InvalidTask);
+            }
+        }
+    }
+    Ok((
+        render_messages(&serde_json::Value::Array(raw), tools, opts),
+        prefix,
+    ))
+}
 
 /// Reasoning-effort level, mirroring `encoding_dsv4`'s `reasoning_effort`
 /// (`"max"` / `"high"` / `None`). Only `Max` alters the prompt — it prepends the
@@ -96,48 +287,84 @@ impl RenderOpts {
     }
 }
 
-/// Resolve the render options for a request, mirroring the engine's dsv4 request
-/// normalization. Reasoning effort follows the engine precedence
-/// (`serving_chat._convert_to_internal_request` pops `chat_template_kwargs.reasoning_effort`
-/// onto the top-level field before the encoder reads it):
-/// `chat_template_kwargs.reasoning_effort` > top-level `reasoning_effort` > env
-/// default; only `max`/`high` alter the prompt. Thinking follows the engine's
-/// `chat_template_kwargs.thinking` truthiness (`serving_chat.py`), else the router's
-/// env default.
+/// Resolve the render options for a request, mirroring the deployed engine's
+/// dsv4 normalization (`protocol.normalize_reasoning_inputs` +
+/// `serving_chat`'s dsv4 branch):
 ///
-/// The router is a separate process from the engine, so it cannot observe an
-/// engine-side default (`SGLANG_DEFAULT_THINKING` / `--default-chat-template-kwargs`)
-/// a request doesn't carry; the env defaults (`SGLANG_ROUTER_DSV4_DEFAULT_THINKING`
-/// / `SGLANG_ROUTER_DSV4_REASONING_EFFORT`, read once) MUST be set to match the
-/// engine's, or cache-aware routing degrades (best-effort, never incorrect — the
-/// engine re-tokenizes for correctness, see `input_ids_safe_to_forward`). Deeper
-/// `protocol.py` normalizations (the `reasoning` object's `effort` alias,
-/// `reasoning_effort="none"` force-disabling thinking, `enable_thinking`) are NOT
-/// mirrored — they too only degrade routing. `enable_thinking` is intentionally
-/// not read: the dsv4 engine path keys solely on `chat_template_kwargs.thinking`.
+/// Thinking: `chat_template_kwargs.thinking` truthiness decides when the key
+/// is PRESENT (an explicit `null` counts as present, per `setdefault`
+/// semantics). Otherwise top-level `reasoning_effort` defaults it — the
+/// protocol validator defaults thinking to `effort != "none"` (a numeric
+/// token-budget effort is always `!= "none"`). Otherwise the engine's
+/// `SGLANG_DEFAULT_THINKING` env, here the router's env-matching default.
+///
+/// Reasoning effort: `serving_chat._convert_to_internal_request` pops
+/// `chat_template_kwargs.reasoning_effort` ONTO the top-level field BEFORE
+/// the dsv4 branch reads it — so the effective precedence is
+/// `chat_template_kwargs.reasoning_effort` (present non-null, wins even over
+/// a set top-level) > top-level `reasoning_effort` > the engine's
+/// `SGLANG_DSV4_REASONING_EFFORT` env, env consulted ONLY when both are
+/// absent/null. Any other present value collapses to `None` WITHOUT
+/// consulting the env default. Only `max`/`high` alter the prompt. (Note the
+/// asymmetry with THINKING: the protocol validator's thinking-setdefault runs
+/// at parse time, before the ctk pop, so ctk effort never defaults thinking
+/// — only a top-level effort does.)
+///
+/// The router is a separate process from the engine, so it cannot observe the
+/// engine's `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT` env
+/// defaults a request doesn't carry; the router's
+/// `SGLANG_ROUTER_DSV4_DEFAULT_THINKING` / `SGLANG_ROUTER_DSV4_REASONING_EFFORT`
+/// (read once) MUST be set to match them, or routing degrades and plain
+/// requests can be forwarded as wrong-mode ids (the predicate can't detect
+/// such a mismatch — see `input_ids_safe_to_forward_dsv4`'s deploy note). The
+/// `reasoning` OBJECT's deeper normalization (`effort`/`enabled` aliases) is
+/// NOT mirrored — it is withheld from forwarding instead (same predicate), and
+/// only degrades routing here.
 pub fn resolve_render_opts(request: &serde_json::Value) -> RenderOpts {
-    let ctk = request.get("chat_template_kwargs");
-
-    let effort = ctk
-        .and_then(|k| k.get("reasoning_effort"))
-        .and_then(|v| v.as_str())
-        .or_else(|| request.get("reasoning_effort").and_then(|v| v.as_str()))
-        .map(str::to_owned)
-        .or_else(|| default_reasoning_effort().clone());
-    let reasoning_effort = match effort.as_deref() {
-        Some("max") => ReasoningEffort::Max,
-        Some("high") => ReasoningEffort::High,
-        _ => ReasoningEffort::None,
+    let thinking = match request
+        .get("chat_template_kwargs")
+        .and_then(|k| k.as_object())
+        .and_then(|o| o.get("thinking"))
+    {
+        Some(v) => json_truthy(v),
+        None => match request.get("reasoning_effort").filter(|e| !e.is_null()) {
+            Some(e) => !matches!(e, serde_json::Value::String(s) if s == "none"),
+            None => default_thinking(),
+        },
     };
 
-    let thinking = ctk
-        .and_then(|k| k.get("thinking"))
-        .map(json_truthy)
-        .unwrap_or_else(default_thinking);
+    // Effective effort source, mirroring the engine's ctk-pop-with-precedence.
+    let effort_field = request
+        .get("chat_template_kwargs")
+        .and_then(|k| k.as_object())
+        .and_then(|o| o.get("reasoning_effort"))
+        .filter(|v| !v.is_null())
+        .or_else(|| request.get("reasoning_effort"));
+    let reasoning_effort = match effort_field {
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "max" => ReasoningEffort::Max,
+            "high" => ReasoningEffort::High,
+            _ => ReasoningEffort::None,
+        },
+        // Absent or explicit null (both channels): the engine consults env.
+        Some(serde_json::Value::Null) | None => default_effort_enum(),
+        // Any other present value (numeric, bool, …): never `max`/`high`, and
+        // the env default is NOT consulted.
+        Some(_) => ReasoningEffort::None,
+    };
 
     RenderOpts {
         thinking,
         reasoning_effort,
+    }
+}
+
+/// The env default resolved to an enum (only `max`/`high` matter).
+fn default_effort_enum() -> ReasoningEffort {
+    match default_reasoning_effort().as_deref() {
+        Some("max") => ReasoningEffort::Max,
+        Some("high") => ReasoningEffort::High,
+        _ => ReasoningEffort::None,
     }
 }
 
@@ -243,7 +470,12 @@ fn default_reasoning_effort() -> &'static Option<String> {
 
 /// The `encoding_dsv4.REASONING_EFFORT_MAX` preamble, emitted at the very front
 /// of the prompt (after BOS, before the system content) only in thinking mode
-/// with `reasoning_effort == Max`. Kept byte-identical to the engine.
+/// with `reasoning_effort == Max`. Kept byte-identical to the engine. NOTE:
+/// newer engine builds split effort rendering into PREVIEW and OFFICIAL
+/// profiles (only preview exists in the deployed build this constant is
+/// pinned against); under the official profile `high` emits a preamble and
+/// `max` uses different text — an engine upgrade to such a build must be
+/// re-mirrored here (see the deploy note in `input_ids_safe_to_forward_dsv4`).
 const REASONING_EFFORT_MAX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
 /// Render `messages` (+ the request's top-level `tools`) into the DeepSeek-V4
@@ -266,8 +498,8 @@ const REASONING_EFFORT_MAX: &str = "Reasoning Effort: Absolute maximum with no s
 /// ordered by their originating call (`sort_tool_results_by_call_order`); and in
 /// thinking mode the `<think>` transitions and prior-turn `reasoning_content`
 /// render per the engine's `drop_thinking` rules (see [`render_one`],
-/// [`drop_thinking_messages`]). `tasks` stay out of scope — they never appear on
-/// router traffic.
+/// [`drop_thinking_messages`]). Request-level engine behaviors on top of this
+/// (`task` attachment, trailing-assistant surgery) live in [`render_request`].
 pub fn render_messages(
     messages: &serde_json::Value,
     tools: Option<&serde_json::Value>,
@@ -392,13 +624,17 @@ enum Block {
 /// A message after `merge_tool_messages`. `blocks` is `Some` only for user turns
 /// (their text + folded-in tool results); `tool_calls` is non-empty only for
 /// assistant turns; `reasoning_content` is a prior assistant turn's thinking
-/// block, rendered only in thinking mode (see [`render_one`]).
+/// block, rendered only in thinking mode (see [`render_one`]). `task` is the
+/// engine's quick-instruction task key (request-attached or message-level),
+/// preserved through the merge the way `encoding_dsv4.merge_tool_messages`
+/// preserves it.
 struct MergedMsg {
     role: String,
     content: String,
     tool_calls: Vec<ToolCall>,
     blocks: Option<Vec<Block>>,
     reasoning_content: String,
+    task: Option<String>,
 }
 
 impl MergedMsg {
@@ -409,13 +645,30 @@ impl MergedMsg {
             tool_calls: Vec::new(),
             blocks: None,
             reasoning_content: String::new(),
+            task: None,
         }
     }
 }
 
-/// Index of the trailing message iff it is a user turn already carrying blocks —
-/// i.e. one a following tool/user message should fold into.
+/// Index of the trailing message iff it is a user turn a following USER
+/// message should merge into: carrying blocks and with NO task — the
+/// engine's user-merge guard (`merged[-1].get("task") is None`), which exists
+/// only on the user fold: a task-carrying user turn terminates the run so
+/// the following user message starts fresh (keeping its own keys).
 fn open_user_idx(merged: &[MergedMsg]) -> Option<usize> {
+    match merged.last() {
+        Some(last) if last.role == "user" && last.blocks.is_some() && last.task.is_none() => {
+            Some(merged.len() - 1)
+        }
+        _ => None,
+    }
+}
+
+/// Index of the trailing message iff it is a user turn a TOOL message should
+/// fold into: carrying blocks — the engine's tool fold has NO task guard
+/// (`merged[-1].get("role") == "user" and "content_blocks" in merged[-1]`),
+/// so a tool result folds into a task-carrying run too.
+fn open_tool_fold_idx(merged: &[MergedMsg]) -> Option<usize> {
     match merged.last() {
         Some(last) if last.role == "user" && last.blocks.is_some() => Some(merged.len() - 1),
         _ => None,
@@ -425,9 +678,8 @@ fn open_user_idx(merged: &[MergedMsg]) -> Option<usize> {
 /// Mirror `encoding_dsv4.merge_tool_messages`: DeepSeek-V4 has no standalone
 /// `tool` role, so a tool message folds into the preceding (or a fresh) user
 /// turn as a `tool_result` block, and consecutive user turns coalesce into one
-/// with a text block each. Other roles pass through unchanged. (The engine's
-/// `task is None` guard on user-merge is irrelevant here — tasks are out of
-/// scope, so a user run always coalesces.)
+/// with a text block each. Other roles pass through unchanged. Message-level
+/// `task` keys are preserved the way the engine preserves extra fields.
 fn merge_tool_messages(raw: &[serde_json::Value]) -> Vec<MergedMsg> {
     let mut merged: Vec<MergedMsg> = Vec::with_capacity(raw.len());
     for m in raw {
@@ -438,7 +690,7 @@ fn merge_tool_messages(raw: &[serde_json::Value]) -> Vec<MergedMsg> {
                     content: tool_result_content(m.get("content")),
                     tool_use_id: str_field(m, "tool_call_id"),
                 };
-                match open_user_idx(&merged) {
+                match open_tool_fold_idx(&merged) {
                     Some(idx) => merged[idx].blocks.as_mut().unwrap().push(block),
                     None => {
                         let mut um = MergedMsg::plain("user");
@@ -455,6 +707,7 @@ fn merge_tool_messages(raw: &[serde_json::Value]) -> Vec<MergedMsg> {
                         let mut um = MergedMsg::plain("user");
                         um.content = text.clone();
                         um.blocks = Some(vec![Block::Text(text)]);
+                        um.task = str_field_opt(m, "task");
                         merged.push(um);
                     }
                 }
@@ -467,11 +720,13 @@ fn merge_tool_messages(raw: &[serde_json::Value]) -> Vec<MergedMsg> {
                 // `reasoning_content or ""` (a plain string), so pass it through
                 // as-is; a missing/non-string value is treated as empty.
                 am.reasoning_content = str_field(m, "reasoning_content");
+                am.task = str_field_opt(m, "task");
                 merged.push(am);
             }
             other => {
                 let mut om = MergedMsg::plain(other);
                 om.content = content_to_string(m.get("content"));
+                om.task = str_field_opt(m, "task");
                 merged.push(om);
             }
         }
@@ -593,9 +848,14 @@ fn render_one(
             // `</think>` before its content; the opening `<think>` came from the
             // preceding user turn's transition below. Kept when reasoning isn't
             // being dropped (tools present) OR this turn is strictly after the last
-            // user turn — matching `encoding_dsv4.render_message` (`prev_has_task`
-            // is always false here; tasks are out of scope). Chat mode emits none.
-            if opts.thinking && (!effective_drop_thinking || i as i64 > last_user_idx) {
+            // user turn — matching `encoding_dsv4.render_message`, including its
+            // `prev_has_task` rule: a task on the PRECEDING message marks this
+            // turn as a task output, whose thinking is never rendered.
+            let prev_has_task = i > 0 && msgs[i - 1].task.is_some();
+            if opts.thinking
+                && !prev_has_task
+                && (!effective_drop_thinking || i as i64 > last_user_idx)
+            {
                 out.push_str(&m.reasoning_content);
                 out.push_str(THINK_END);
             }
@@ -611,14 +871,34 @@ fn render_one(
         _ => out.push_str(&m.content),
     }
 
-    // Generation-prompt transition. The engine appends it only when this is the
-    // last message OR the next message is an assistant/reminder turn, and only
-    // for user/developer messages.
+    // Generation-prompt / task transition. The engine appends it only when this
+    // is the last message OR the next message is an assistant/reminder turn.
     let next_takes_transition = match msgs.get(i + 1) {
         Some(next) => next.role == "assistant" || next.role == "latest_reminder",
         None => true,
     };
-    if next_takes_transition && (m.role == "user" || m.role == "developer") {
+    if !next_takes_transition {
+        return;
+    }
+    if let Some(task) = m.task.as_deref() {
+        // Task transition (`encoding_dsv4.render_message`): any non-`action`
+        // task appends its special token directly — without the assistant
+        // opening — while `action` opens an assistant turn first. Task names
+        // are validated in `render_request`; plain-render callers must
+        // pre-gate instead (the cache-sim shape gate does).
+        let sp = task_sp_token(task).expect("task validated by the caller's gate");
+        if task != "action" {
+            out.push_str(sp);
+        } else {
+            out.push_str(ASSISTANT);
+            out.push_str(if opts.thinking {
+                THINK_START
+            } else {
+                THINK_END
+            });
+            out.push_str(sp);
+        }
+    } else if m.role == "user" || m.role == "developer" {
         out.push_str(ASSISTANT);
         // Chat mode always closes with `</think>`. Thinking mode opens the next
         // assistant turn with `<think>`: always when reasoning is kept (tools
@@ -690,25 +970,28 @@ fn encode_arguments_to_dsml(arguments: &serde_json::Value) -> String {
         .join("\n")
 }
 
-/// Flatten a `tool` message's `content` for a `<tool_result>` body: a string as
-/// is; a parts array to its `text` parts joined with `\n\n` (non-text parts
-/// become `[Unsupported <type>]`), mirroring the engine's list handling.
+/// Flatten a `tool` message's `content` for a `<tool_result>` body, mirroring
+/// the engine's pre-merge flatten on the dsv4 path
+/// (`process_content_for_template_format(_, "string")` runs over EVERY client
+/// message, tool messages included): a string as-is; an array to its text
+/// parts joined with a single space, non-text parts dropped. (The
+/// `[Unsupported <type>]` shape seen in `encoding_dsv4` only applies to
+/// engine-internal `content_blocks`, which clients cannot send.)
 fn tool_result_content(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
-            .map(|p| match p.get("text").and_then(|t| t.as_str()) {
-                Some(t) => t.to_string(),
-                None => format!(
-                    "[Unsupported {}]",
-                    p.get("type").and_then(|t| t.as_str()).unwrap_or("")
-                ),
-            })
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
-            .join("\n\n"),
+            .join(" "),
         _ => String::new(),
     }
+}
+
+/// A message field as an optional owned string (`None` when absent/non-string).
+fn str_field_opt(m: &serde_json::Value, key: &str) -> Option<String> {
+    m.get(key).and_then(|v| v.as_str()).map(str::to_owned)
 }
 
 /// A message field as an owned string, empty when absent/non-string.
@@ -723,10 +1006,13 @@ fn str_field(m: &serde_json::Value, key: &str) -> String {
 /// OpenAI parts array to its `type == "text"` parts joined with a single space
 /// (mirroring `process_content_for_template_format(_, "string")`, which the
 /// engine applies to dsv4 before encoding and which ignores non-text parts);
-/// anything else to empty.
+/// a NUMBER coerced to string (pydantic's lax `Union[str, List[...], None]`
+/// coerces ints/floats before the engine ever renders); anything else
+/// (bool/object — the engine 422s those) to empty.
 fn content_to_string(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
             .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
@@ -1263,8 +1549,10 @@ mod tests {
     }
 
     /// `resolve_render_opts` honors per-request overrides (the paths that don't
-    /// depend on env): `chat_template_kwargs.thinking` truthiness, and the effort
-    /// precedence `chat_template_kwargs.reasoning_effort` > top-level > (env).
+    /// depend on env): `chat_template_kwargs.thinking` truthiness; `reasoning_effort`
+    /// top-level ONLY (the engine's dsv4 branch never reads it from
+    /// chat_template_kwargs); and the protocol validator's thinking default
+    /// (effort present → `!= "none"`).
     #[test]
     fn resolve_render_opts_request_overrides() {
         let opts = resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": true}}));
@@ -1282,7 +1570,9 @@ mod tests {
             !resolve_render_opts(&json!({"chat_template_kwargs": {"thinking": null}})).thinking
         );
 
-        // chat_template_kwargs.reasoning_effort wins over the top-level field.
+        // chat_template_kwargs.reasoning_effort is popped ONTO the top-level
+        // field by `_convert_to_internal_request` before the dsv4 branch reads
+        // it — ctk wins over a set top-level.
         assert_eq!(
             resolve_render_opts(&json!({
                 "reasoning_effort": "high",
@@ -1291,7 +1581,15 @@ mod tests {
             .reasoning_effort,
             ReasoningEffort::Max
         );
-        // top-level reasoning_effort is honored when chat_template_kwargs lacks it.
+        // …but a present-null ctk value lets the top-level field through.
+        assert_eq!(
+            resolve_render_opts(&json!({
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"reasoning_effort": null}
+            }))
+            .reasoning_effort,
+            ReasoningEffort::High
+        );
         assert_eq!(
             resolve_render_opts(&json!({"reasoning_effort": "high"})).reasoning_effort,
             ReasoningEffort::High
@@ -1301,6 +1599,24 @@ mod tests {
             resolve_render_opts(&json!({"reasoning_effort": "medium"})).reasoning_effort,
             ReasoningEffort::None
         );
+        // and thinking still defaults from effort != "none".
+        assert!(resolve_render_opts(&json!({"reasoning_effort": "medium"})).thinking);
+        // a present-null effort falls to the (false) env default for thinking…
+        assert!(!resolve_render_opts(&json!({"reasoning_effort": null})).thinking);
+        // …while an explicit null THINKING key wins over the effort default
+        // (setdefault semantics: key presence, not truthiness).
+        assert!(
+            !resolve_render_opts(
+                &json!({"chat_template_kwargs": {"thinking": null}, "reasoning_effort": "high"})
+            )
+            .thinking
+        );
+        // "none" effort force-disables thinking (validator: thinking = effort != "none").
+        assert!(!resolve_render_opts(&json!({"reasoning_effort": "none"})).thinking);
+        // numeric (token-budget) effort: thinking on, effort None, env not consulted.
+        let o = resolve_render_opts(&json!({"reasoning_effort": 512}));
+        assert!(o.thinking);
+        assert_eq!(o.reasoning_effort, ReasoningEffort::None);
     }
 
     /// The env-default resolvers (the deploy-critical `SGLANG_ROUTER_DSV4_*` knobs):
@@ -1326,5 +1642,372 @@ mod tests {
         );
         assert_eq!(resolve_default_effort(Some("medium")), None); // engine keeps only max/high
         assert_eq!(resolve_default_effort(Some("")), None);
+    }
+
+    /// mirror `normalize_reasoning_inputs` + `_handle_last_assistant_message` cases.
+
+    /// trailing assistant + continue_final_message=true: dropped; prefix back.
+    /// flag unset: role rewritten to user; prefix none; generation prompt follows.
+    /// engine bytes verified against serving_chat._handle_last_assistant_message.
+    #[test]
+    fn handle_trailing_assistant_both_flag_states() {
+        let (text, prefix) = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":"A-prefix"}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts {
+                task: None,
+                continue_final_message: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(prefix.as_deref(), Some("A-prefix"));
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>U1<｜Assistant｜></think>"
+        );
+        // The prefix lands AFTER that generation prompt at encode time
+        // (see TokenizerRegistry::encode_chat's append), not before.
+
+        // No surgery: trailing assistant rewritten to user, coalesced into the
+        // preceding user run, then the generation prompt.
+        let (text, prefix) = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":"A2"}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts::default(),
+        )
+        .unwrap();
+        assert_eq!(prefix, None);
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>U1\n\nA2<｜Assistant｜></think>"
+        );
+        assert_eq!(
+            text,
+            render_messages(
+                &json!([
+                    {"role":"user","content":"U1"},
+                    {"role":"user","content":"A2"}
+                ]),
+                None,
+                RenderOpts::chat()
+            ),
+            "the rewrite must behave exactly like a client-sent user role"
+        );
+    }
+
+    /// continue_final_message=true WITHOUT a trailing assistant is a no-op.
+    #[test]
+    fn continue_final_message_without_trailing_assistant_is_noop() {
+        let (text, prefix) = render_request(
+            &json!([{"role":"user","content":"hi"}]),
+            None,
+            RenderOpts::chat(),
+            RequestParts {
+                task: None,
+                continue_final_message: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(prefix, None);
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
+        );
+    }
+
+    /// The engine flattens content BEFORE the surgery, so array content with
+    /// only text parts and null content both see the surgery — the flattened
+    /// string is the prefix/rewrite content.
+    #[test]
+    fn trailing_assistant_flattened_content_shapes() {
+        // all-text parts array, continue_final_message=true
+        let (_, prefix) = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":[{"type":"text","text":"AB"},{"type":"text","text":"CD"}]}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts {
+                task: None,
+                continue_final_message: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(prefix.as_deref(), Some("AB CD"));
+
+        // null content: flattened to "" — surgery still runs.
+        let (text, prefix) = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":null}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts {
+                task: None,
+                continue_final_message: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(prefix.as_deref(), Some(""));
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>U1<｜Assistant｜></think>"
+        );
+    }
+
+    /// The flag-false rewrite REPLACES the message wholesale, like the engine
+    /// — a message-level `task` key on the trailing assistant must NOT
+    /// survive, or the render would emit a task transition the engine never
+    /// does.
+    #[test]
+    fn rewrite_drops_message_level_task_key() {
+        let (text, _) = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":"A2","task":"query"}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts::default(),
+        )
+        .unwrap();
+        assert!(
+            !text.contains("<｜query｜>"),
+            "task key must not survive; {text}"
+        );
+        assert!(text.contains("U1\n\nA2<｜Assistant｜></think>"), "{text}");
+    }
+
+    #[test]
+    fn attach_task_errors_and_last_user_targeting() {
+        assert_eq!(
+            attach_task(&mut vec![json!({"role":"system","content":"s"})], "query"),
+            Err(RenderErr::TaskWithoutUser)
+        );
+        assert_eq!(
+            attach_task(&mut vec![json!({"role":"user","content":"u"})], "bogus"),
+            Err(RenderErr::InvalidTask)
+        );
+        let mut msgs = vec![
+            json!({"role":"user","content":"first"}),
+            json!({"role":"assistant","content":"a"}),
+            json!({"role":"user","content":"last"}),
+        ];
+        attach_task(&mut msgs, "query").unwrap();
+        assert_eq!(msgs[0].get("task"), None);
+        assert_eq!(msgs[2]["task"], json!("query"));
+    }
+
+    /// Non-`action` tasks append their special token WITHOUT the assistant
+    /// opening; `action` opens an assistant turn first, with the think token
+    /// keyed purely on the mode (no drop_thinking dependence).
+    #[test]
+    fn task_transition_tokens() {
+        let user_task = |task: &str, thinking: bool| {
+            render_request(
+                &json!([{"role":"user","content":"do it"}]),
+                None,
+                RenderOpts {
+                    thinking,
+                    reasoning_effort: ReasoningEffort::None,
+                },
+                RequestParts {
+                    task: Some(task),
+                    continue_final_message: false,
+                },
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(
+            user_task("query", false),
+            "<｜begin▁of▁sentence｜><｜User｜>do it<｜query｜>"
+        );
+        assert_eq!(
+            user_task("action", false),
+            "<｜begin▁of▁sentence｜><｜User｜>do it<｜Assistant｜></think><｜action｜>"
+        );
+        assert_eq!(
+            user_task("action", true),
+            "<｜begin▁of▁sentence｜><｜User｜>do it<｜Assistant｜><think><｜action｜>"
+        );
+        // message-level task key in the post-attach render layer (what the
+        // engine's merge/render sees after `attach_task_to_last_user_message`
+        // writes it onto a raw message).
+        assert_eq!(
+            render_messages(
+                &json!([{"role":"user","content":"do it","task":"query"}]),
+                None,
+                RenderOpts::chat(),
+            ),
+            "<｜begin▁of▁sentence｜><｜User｜>do it<｜query｜>"
+        );
+    }
+
+    /// Client-sent message-level `task` keys are stripped upstream (the
+    /// engine's message model has no such field — only the pydantic-declared
+    /// `request.task` path can ever produce a task transition). The strip
+    /// applies to invalid names too: no engine assert can be triggered by a
+    /// key the engine never sees.
+    #[test]
+    fn client_message_level_task_is_stripped() {
+        let rendered = render_request(
+            &json!([
+                {"role":"user","content":"do it","task":"query"},
+                {"role":"user","content":"do more","task":"bogus"}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(!rendered.contains("<｜query｜>"), "{rendered}");
+        assert_eq!(
+            rendered,
+            "<｜begin▁of▁sentence｜><｜User｜>do it\n\ndo more<｜Assistant｜></think>"
+        );
+        // roles normalize to lowercase the same way.
+        let rendered = render_request(
+            &json!([{"role":"User","content":"hi"}]),
+            None,
+            RenderOpts::chat(),
+            RequestParts::default(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            rendered,
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
+        );
+    }
+
+    /// `prev_has_task`: the assistant turn directly after a task-carrying
+    /// message is a task OUTPUT — its thinking is never rendered, even in
+    /// thinking mode with tools (which normally KEEPS prior reasoning).
+    #[test]
+    fn prev_has_task_suppresses_thinking() {
+        let thinking = |with_task: bool| {
+            let mut msgs = vec![
+                json!({"role":"system","content":"s"}),
+                json!({"role":"user","content":"q"}),
+            ];
+            if with_task {
+                msgs[1]["task"] = json!("query");
+            }
+            msgs.push(
+                json!({"role":"assistant","content":"answer","reasoning_content":"my reasoning"}),
+            );
+            msgs.push(json!({"role":"user","content":"next"}));
+            let tools = json!([{"type":"function","function":{"name":"f"}}]);
+            render_messages(
+                &serde_json::Value::Array(msgs),
+                Some(&tools),
+                RenderOpts {
+                    thinking: true,
+                    reasoning_effort: ReasoningEffort::None,
+                },
+            )
+        };
+        assert!(thinking(false).contains("my reasoning</think>"));
+        assert!(
+            !thinking(true).contains("my reasoning"),
+            "task output must not render its reasoning"
+        );
+        // EOS/tool-calls still render around it.
+        assert!(thinking(true).contains("answer<｜end▁of▁sentence｜>"));
+    }
+
+    /// Ordering: surgery first, then `task` attach (engine pipeline). With
+    /// `continue_final_message` unset the trailing assistant is rewritten to
+    /// user BEFORE the attach sees the list — and the preceding plain user
+    /// run then MERGES it in, which drops the incoming task key exactly like
+    /// `encoding_dsv4.merge_tool_messages` (its run-append guard only carries
+    /// blocks). So this shape emits the plain generation prompt, not a task
+    /// token — task-special-token rendering requires the task to land on a
+    /// run-terminating message.
+    #[test]
+    fn surgery_runs_before_task_attach_and_merge_is_engine_faithful() {
+        let rendered = render_request(
+            &json!([
+                {"role":"user","content":"U1"},
+                {"role":"assistant","content":"A2"}
+            ]),
+            None,
+            RenderOpts::chat(),
+            RequestParts {
+                task: Some("query"),
+                continue_final_message: false,
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            rendered, "<｜begin▁of▁sentence｜><｜User｜>U1\n\nA2<｜Assistant｜></think>",
+            "task dropped by the user-run merge guard, as engine-side; {rendered}"
+        );
+    }
+
+    /// Merge semantics with tasks: a task-carrying user turn TERMINATES a user
+    /// run (a following user starts fresh), but a following TOOL message still
+    /// folds INTO the task turn (the tool fold has no task guard engine-side).
+    /// Transitions (including a task token) render only when the NEXT message
+    /// is an assistant/reminder turn or the message is last — so a task on a
+    /// user turn followed by another user turn emits no task token at all.
+    #[test]
+    fn task_merge_guard_and_tool_fold() {
+        // {user(task), user}: no merge, and the first turn gets NO task
+        // transition (next is a user, not an assistant turn).
+        let text = render_messages(
+            &json!([
+                {"role":"user","content":"a","task":"query"},
+                {"role":"user","content":"b"}
+            ]),
+            None,
+            RenderOpts::chat(),
+        );
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>a<｜User｜>b<｜Assistant｜></think>"
+        );
+
+        // task on a NON-final user followed by an assistant turn: the task
+        // token lands between the turns.
+        let text = render_messages(
+            &json!([
+                {"role":"user","content":"a","task":"query"},
+                {"role":"assistant","content":"b"}
+            ]),
+            None,
+            RenderOpts::chat(),
+        );
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>a<｜query｜>b<｜end▁of▁sentence｜>"
+        );
+
+        // {user(task), tool}: the tool result folds into the task run's blocks.
+        let text = render_messages(
+            &json!([
+                {"role":"user","content":"q","task":"query"},
+                {"role":"tool","content":"result","tool_call_id":"c1"}
+            ]),
+            None,
+            RenderOpts::chat(),
+        );
+        assert_eq!(
+            text,
+            "<｜begin▁of▁sentence｜><｜User｜>q\n\n<tool_result>result</tool_result><｜query｜>",
+        );
     }
 }
