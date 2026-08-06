@@ -967,3 +967,27 @@ class TestPublishLifecycle(_IsolatedServerArgs):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolvedConfigDictSource(_IsolatedServerArgs):
+    """The readback reports the bags, which is what makes it survive the move to
+    a raw-input ``ServerArgs``: an override lands on a bag and shows up without
+    a second overlay pass, and a field the pipeline resolved reports its
+    resolved value even though the instance is only the startup record."""
+
+    def test_an_override_shows_up_without_an_overlay_pass(self):
+        published = get_context().override_server_args(page_size=1).install()
+        self.addCleanup(get_context().override_server_args().restore)
+        get_context().override("test.readback", page_size=64)
+        self.assertEqual(get_context().resolved_server_args_dict()["page_size"], 64)
+        # The startup record is untouched; only the bag moved.
+        self.assertEqual(published.page_size, 1)
+
+    def test_non_namespaced_entries_still_come_from_the_instance(self):
+        published = get_context().override_server_args(tp_size=2).install()
+        self.addCleanup(get_context().override_server_args().restore)
+        d = get_context().resolved_server_args_dict()
+        # `vars()` carries the pipeline's private bookkeeping; the dict keeps it.
+        self.assertIn("_declarations_materialized", d)
+        self.assertEqual(set(d) & {"tp_size"}, {"tp_size"})
+        self.assertEqual(d["tp_size"], published.tp_size)

@@ -936,11 +936,18 @@ class RuntimeContext:
         in a readback: HiCache attach/detach, the generated forward-pass-metrics
         endpoint, tunables set via ``/set_internal_state``.
 
-        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
-        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first. Override leaves are flat
-        ``ServerArgs`` field names, so overlaying them onto the top level of
-        either base is exact.
+        The resolved value of every namespaced field comes from its **bag**, not
+        from the instance: the bags are what ``override`` writes, so they carry
+        the post-publish changes without a second overlay pass, and they will
+        keep carrying the resolved values once the instance holds only the
+        user's raw input. Entries that are not namespaced fields (private
+        bookkeeping, ``model_config``) come from the instance, matching the
+        legacy ``vars`` dump key for key.
+
+        ``base`` defaults to ``dict(vars(server_args))``; pass
+        ``dataclasses.asdict(server_args)`` when nested dataclass fields must be
+        expanded first (its namespaced entries are replaced by the bag values
+        just the same).
 
         This covers the process-global bags only. Per-engine control-plane
         changes (weight version, model path, the tokenizer's HiCache mirror)
@@ -950,8 +957,26 @@ class RuntimeContext:
         one merged dict.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
-        for _source, fields in self._overrides_log:
-            d.update(fields)
+        bags = self._config_bags
+        if bags is None:
+            # Not published (a sentinel slot in tests): the instance is all
+            # there is, so fall back to the historical overlay.
+            for _source, fields in self._overrides_log:
+                d.update(fields)
+            return d
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+
+        for field, path in namespace_of(type(self._server_args)).items():
+            parts = path.split(".")
+            bag = bags.get(parts[0])
+            if bag is None:
+                continue
+            for segment in parts[1:]:
+                bag = object.__getattribute__(bag, "_subs").get(segment)
+                if bag is None:
+                    break
+            if bag is not None and field in bag:
+                d[field] = getattr(bag, field)
         return d
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
