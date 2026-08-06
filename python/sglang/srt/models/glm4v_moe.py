@@ -11,6 +11,7 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import record_shared_experts_fusion_decision
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
@@ -84,6 +85,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
     def determine_num_fused_shared_experts(self):
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -99,18 +101,14 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Glm4vMoeForConditionalGeneration.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = self.config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1

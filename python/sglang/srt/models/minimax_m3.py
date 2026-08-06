@@ -54,7 +54,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_shared_experts_fusion_disabled,
+    record_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -287,9 +291,7 @@ class MiniMaxM3MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
-            0
-            if get_exec().moe.disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
 
         if self.tp_size > config.num_local_experts:
@@ -1467,6 +1469,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -1490,18 +1493,14 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "MiniMaxM3ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = self.config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1

@@ -10,7 +10,10 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    record_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
@@ -135,6 +138,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -164,18 +168,14 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "MiniMaxM3VLForCausalLM._determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = text_config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1

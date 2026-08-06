@@ -45,6 +45,16 @@ def hybrid_lightning_config(model_config: ModelConfig):
     return None
 
 
+# The MTP drafts of the GDN hybrids are all softmax attention (the MTP model
+# forces full_attention_interval=1), so they must not be treated as hybrid —
+# the same distinction mamba2_config draws for NemotronH below. A STANDALONE
+# draft keeps its own architecture name and its linear layers.
+_GDN_ALL_SOFTMAX_DRAFT_ARCHS = (
+    "Qwen3NextForCausalLMMTP",
+    "Qwen3_5ForCausalLMMTP",
+)
+
+
 def hybrid_gdn_config(model_config: ModelConfig):
     config = model_config.hf_config.get_text_config()
     if isinstance(
@@ -56,6 +66,9 @@ def hybrid_gdn_config(model_config: ModelConfig):
         | JetNemotronConfig
         | JetVLMConfig,
     ):
+        arch = (model_config.hf_config.architectures or [None])[0]
+        if model_config.is_draft_model and arch in _GDN_ALL_SOFTMAX_DRAFT_ARCHS:
+            return None
         return config
     return None
 

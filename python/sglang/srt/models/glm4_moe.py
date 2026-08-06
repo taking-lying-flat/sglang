@@ -68,6 +68,8 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_shared_experts_fusion_disabled,
+    record_shared_experts_fusion_decision,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -400,9 +402,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
-            0
-            if get_exec().moe.disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
 
         self.config = config
@@ -1174,6 +1174,7 @@ class Glm4MoeForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -1196,12 +1197,7 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Glm4MoeForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
@@ -1209,6 +1205,7 @@ class Glm4MoeForCausalLM(nn.Module):
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = self.config.n_shared_experts
 
     def get_input_embeddings(self) -> nn.Embedding:

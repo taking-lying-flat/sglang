@@ -57,6 +57,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+    record_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -137,9 +141,10 @@ cached_get_processor = lru_cache(get_processor)
 
 
 def _disable_shared_experts_fusion() -> bool:
-    # Resolved lazily: the global server args is not set at module import time
-    # (e.g. when this module is imported by unit tests).
-    return get_exec().moe.disable_shared_experts_fusion
+    # Resolved lazily: the flag is written by the owning model's gate before
+    # its layers build (per runner); models without a gate see the config
+    # intent through the accessor's fallback.
+    return is_shared_experts_fusion_disabled()
 
 
 if _is_cuda:
@@ -1311,17 +1316,14 @@ class Qwen3_5ForCausalLM(nn.Module):
     def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
         # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
         # so the model still gets the #25885 multi-streaming path. ROCm-only.
-        if (
-            config.model_type == "qwen3_5_moe_text"
-            and not get_exec().moe.disable_shared_experts_fusion
-            and not can_fuse_shared_expert(config, quant_config)
-        ):
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
-                {"disable_shared_experts_fusion": True},
-            )
+        if config.model_type != "qwen3_5_moe_text":
+            return
+        intent_disabled = get_exec().moe.disable_shared_experts_fusion
+        auto_disabled = not intent_disabled and not can_fuse_shared_expert(
+            config, quant_config
+        )
+        record_shared_experts_fusion_decision(disabled=intent_disabled or auto_disabled)
+        if auto_disabled:
             logger.info(
                 "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
                 "auto-disabling (multi-streaming #25885 still applies)."

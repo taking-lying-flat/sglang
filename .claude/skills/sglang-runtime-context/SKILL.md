@@ -142,14 +142,15 @@ Never assign `server_args` fields from model code. Declare instead
   callable receives *pristine* `server_args` + `hf_config` and must not write.
 - Normalization that must see earlier declarations → a post-process pass invoked via
   `run_post_process_pass` at its slot (reads a view, returns a declaration dict).
-- Values only knowable at weight-load time → `declare_load_time_override(source, {...})`
-  — validates the whitelist, then routes through `get_context().override` (**bag-only**;
-  the declaration lands on the published bags, not on any `ServerArgs` instance).
-  Scope caveat for draft models: only a draft build that publishes a private copy
-  under `preserve_config` discards its declarations with the scope. Draft loads
-  that skip publish share the process bags, so their declarations land
-  process-wide — declares reachable from a draft load must be draft-safe (guard
-  or same-value).
+- Values only knowable at load time are **per-instance state**, not declarations:
+  there is no `declare_load_time_override` any more. A model-family decision that
+  its checkpoint drives (shared-experts fusion) is written — both ways — to the
+  ACTIVE moe flag (`record_shared_experts_fusion_decision`) before that model's
+  layers build and read it (`is_shared_experts_fusion_disabled`, config-intent
+  fallback); `speculative_moe_backend_context` already brackets every draft
+  build, so a draft's decision never outlives its build. A process-level
+  load-time fact (the sm80 dtype fallback — device-driven, identical for every
+  runner) records directly via `get_context().override`.
 
 Declarable fields form a whitelist: `Arg(..., resolvable=True)` in the `ServerArgs`
 dataclass. A declaration against a non-whitelisted field fails at its slot.
@@ -307,7 +308,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
 `publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
-`declare_load_time_override`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
 `test_server_args_writer_ratchet.py`, `test_legacy_global_ratchet.py`,

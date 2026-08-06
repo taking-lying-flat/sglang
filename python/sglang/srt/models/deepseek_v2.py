@@ -117,7 +117,9 @@ from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
     is_sbo_enabled,
+    is_shared_experts_fusion_disabled,
     is_tbo_enabled,
+    record_shared_experts_fusion_decision,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -572,7 +574,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_exec().moe.disable_shared_experts_fusion
+        _fusion_disabled = is_shared_experts_fusion_disabled()
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -2979,6 +2981,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
 
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -3029,12 +3032,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV2ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
@@ -3042,6 +3040,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = self.config.n_shared_experts
 
     def get_input_embeddings(self) -> nn.Embedding:

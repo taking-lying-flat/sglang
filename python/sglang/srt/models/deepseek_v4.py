@@ -84,6 +84,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import record_shared_experts_fusion_decision
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -2555,6 +2556,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_exec().moe.disable_shared_experts_fusion:
+            record_shared_experts_fusion_decision(disabled=True)
             return
 
         disable_reason = None
@@ -2568,18 +2570,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Config does not support fused shared expert(s)."
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
+            record_shared_experts_fusion_decision(disabled=True)
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
             return
 
+        record_shared_experts_fusion_decision(disabled=False)
         self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
