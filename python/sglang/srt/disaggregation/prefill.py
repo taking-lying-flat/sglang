@@ -69,7 +69,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_schedule,
+)
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -1145,7 +1148,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # prefetched grid, so non-last sends must end on a grid
                 # boundary; the remainder rides with the next send.
                 grid_tokens = staging_grid_tokens(
-                    self.server_args.chunked_prefill_size, page_size
+                    get_schedule().chunked_prefill_size, page_size
                 )
                 base = req.disagg_decode_prefix_len
                 end_idx = base + ((end_idx - base) // grid_tokens) * grid_tokens
@@ -1271,7 +1274,7 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
                 req.disagg_decode_prefix_len,
-                staging_grid_tokens(self.server_args.chunked_prefill_size, page_size),
+                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
             )
         else:
             segments = [(start_idx, end_idx)]

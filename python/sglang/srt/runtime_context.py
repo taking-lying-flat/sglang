@@ -1481,3 +1481,13 @@ def configured_moe_dp_size() -> int:
 
 def configured_attn_cp_size() -> int:
     return get_server_args().attn_cp_size
+
+
+def is_ep_joiner() -> bool:
+    """True in a process launched as an elastic-EP joiner (scale or recover)."""
+    return get_server_args().is_ep_joiner
+
+
+def is_ep_scale_joiner() -> bool:
+    """True in a process launched as an elastic-EP scale-up joiner."""
+    return get_server_args().is_ep_scale_joiner
