@@ -51,6 +51,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1037,12 +1038,11 @@ class HiMambaRadixCache(MambaRadixCache):
             node_update = node_update.parent
 
         if len(value) > best_value_len:
-            from sglang.srt.runtime_context import get_server_args
 
-            mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+            chunk_size = mamba_cache_chunk_size()
             mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
+                sum(len(v) for v in value) // chunk_size
+            ) * chunk_size
             mamba_branching_seqlen = (
                 mamba_cache_chunk_aligned_seqlen
                 if mamba_cache_chunk_aligned_seqlen > 0

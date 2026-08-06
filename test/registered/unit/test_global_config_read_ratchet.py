@@ -11,34 +11,44 @@ alias ``sa = get_server_args()`` followed by ``sa.field`` in the same function.
 A whole-object pass (``def f(server_args)``) is not a global read and is not
 counted — there the caller decided which instance to hand over.
 
-What legitimately remains:
+Business code no longer reads the published record for a config value at all:
+the baselines are zero for both shapes, over the whole package minus the two
+modules that own the slot.
 
-- **Derived APIs.** ``@property`` and method members of ``ServerArgs``
-  (``mamba_cache_chunk_size``, ``get_model_config()``,
-  ``enable_mamba_extra_buffer()``, …) are computed from several fields plus the
-  HF config, so they are not namespace leaves and ``ServerArgs`` is their only
-  home. Exempt by name below.
+Where the remaining reads live (``runtime_context.py``, exempt by module):
+
+- **Derived members.** ``@property`` / method members of ``ServerArgs``
+  (``mamba_cache_chunk_size``, ``max_speculative_num_draft_tokens``,
+  ``use_mla_backend()``, ``get_attention_backends()``, ``get_model_config()``,
+  ``cutedsl_moe_max_num_tokens()``) are computed from several fields plus the HF
+  config, so they are not namespace leaves and ``ServerArgs`` is their only
+  home. ``runtime_context`` exposes each one as a named accessor
+  (``mamba_cache_chunk_size()`` …) and is the only module that reads the slot
+  for them.
 - **Config-intent reads of live-shadowed sizes.** ``get_parallel()`` shadows
-  ``tp/pp/dcp/attn_cp/moe_dp_size`` with the live topology, so a config-intent
-  read of one has nowhere else to go. Each exempt site needs an answer the live
-  property cannot give:
+  ``tp/pp/dcp/attn_cp/moe_dp_size`` with the live topology, and a few call sites
+  need what was *configured*: the ``configured_*_size()`` accessors. Their
+  reasons, per call site:
 
-  - ``dsa_indexer.pp_size`` gates ``pp_size > 1 and not get_pp_group()...``, and
-    the short circuit is the point: with PP off the group is never touched, which
-    is what lets the ``Indexer`` be constructed before distributed init. The live
-    property would demand the group either way.
-  - ``allocation.dcp_size`` asks whether DCP was *configured*; the live property
-    reads ``get_dcp_group()``, and that group is only installed when DCP is on.
-  - ``cuda_ipc_transport_utils.tp_size`` runs in the tokenizer process, which has
-    no groups at all (the call site already guards for "not published yet").
-  - ``dp_attention.attn_cp_size`` / ``moe_dp_size``: the configuration the
-    predicate detects (``attn_cp_size > moe_dp_size``) is the one where
-    ``initialize_model_parallel`` aliases ``_MOE_DP`` to ``_ATTN_CP``, so the live
-    sizes are equal there and a live comparison is always false.
-  - ``model_loader/loader.py`` reports both: the same dict carries the live
+  - ``dsa_indexer`` gates ``pp_size > 1 and not get_pp_group()...``, and the
+    short circuit is the point: with PP off the group is never touched, which is
+    what lets the ``Indexer`` be constructed before distributed init.
+  - ``allocation`` asks whether DCP was *configured*; the live property reads
+    ``get_dcp_group()``, installed only when DCP is on.
+  - ``cuda_ipc_transport_utils`` runs in the tokenizer process, which has no
+    groups at all.
+  - ``dp_attention``'s ``attn_cp_size > moe_dp_size``: the configuration the
+    predicate detects is the one where ``initialize_model_parallel`` aliases
+    ``_MOE_DP`` to ``_ATTN_CP``, so the live sizes are equal there and a live
+    comparison is always false.
+  - ``model_loader/loader`` reports both: the same dict carries the live
     ``moe_dp_size`` under ``"dp"``, so this entry is the configured intent.
-- The alias-form baseline is not zero yet. Lowering it is the next slice; the
-  failure message lists the sites whenever the count moves.
+
+A whole-object pass (``def f(server_args)``) is not a global read and is not
+counted -- there the caller decided which instance to hand over. An optional
+parameter that falls back to the global (``f(server_args=None)``) hides one,
+so those fallbacks were removed; the ratchet cannot see them and the census
+tool in the context repo is what audits that shape.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -56,30 +66,11 @@ from sglang.test.test_utils import CustomTestCase
 # scanned so a new one cannot appear there unnoticed.
 _PACKAGE_ROOT = Path(next(iter(sglang.__path__)))
 
-_DERIVED_MEMBERS = frozenset(
-    {
-        "cutedsl_moe_max_num_tokens",
-        "enable_mamba_extra_buffer",
-        "enable_mamba_extra_buffer_lazy",
-        "get_attention_backends",
-        "get_model_config",
-        "mamba_cache_chunk_size",
-        "max_speculative_num_draft_tokens",
-        "model_config",
-        "use_mla_backend",
-    }
-)
+# The modules that own the slot: runtime_context publishes it and exposes the
+# named accessors for the derived members, server_args/arg_groups ARE the
+# resolution pipeline.
+_SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/")
 
-_CONFIG_INTENT_SIZES = frozenset(
-    {
-        ("srt/layers/attention/dsa/dsa_indexer.py", "pp_size"),
-        ("srt/layers/dp_attention.py", "attn_cp_size"),
-        ("srt/layers/dp_attention.py", "moe_dp_size"),
-        ("srt/mem_cache/allocation.py", "dcp_size"),
-        ("srt/model_loader/loader.py", "moe_dp_size"),
-        ("srt/utils/cuda_ipc_transport_utils.py", "tp_size"),
-    }
-)
 
 _DIRECT_BASELINE = 0
 _ALIAS_BASELINE = 0
@@ -98,7 +89,7 @@ def _collect(rel: str, tree: ast.AST):
     direct, alias = [], []
 
     def counted(attr: str) -> bool:
-        return attr not in _DERIVED_MEMBERS and (rel, attr) not in _CONFIG_INTENT_SIZES
+        return True
 
     for node in ast.walk(tree):
         if (
@@ -138,6 +129,8 @@ def _field_reads():
     direct, alias = [], []
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+        if rel.startswith(_SLOT_OWNERS):
+            continue
         try:
             tree = ast.parse(path.read_text())
         except SyntaxError:
